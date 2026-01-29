@@ -1,1 +1,3 @@
 targets = [ "NON_EXISTENT", "XDG_SESSION_ID", "XDG_RUNTIME_DIR", "XDG_SEAT", "XDG_VTNR", "DBUS_SESSION_BUS_ADDRESS", "PATH" ]
+compositor_service = "niri.service"
+compositor_shutdown = "niri-shutdown.target"
