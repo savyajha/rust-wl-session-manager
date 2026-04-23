@@ -21,6 +21,12 @@ pub trait SystemdManager {
 
     #[zbus(name = "GetUnit")]
     fn get_unit(&self, name: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+
+    #[zbus(name = "ResetFailedUnit")]
+    fn reset_failed_unit(&self, name: &str) -> zbus::Result<()>;
+
+    #[zbus(property, name = "Environment")]
+    fn environment(&self) -> zbus::Result<Vec<String>>;
 }
 
 #[proxy(
@@ -38,6 +44,9 @@ pub trait SessionLeaderExt {
 
 impl<'a> SessionLeaderExt for SessionLeaderProxy<'a> {
     async fn wait_for_unit_exit(&self) -> zbus::Result<()> {
+        // Subscribe first: PropertyStream buffers events from this point on.
+        // The active_state() read below catches any transition that completed
+        // before the subscription was established.
         let mut stream = self.receive_active_state_changed().await;
 
         let current = self.active_state().await?;
@@ -54,4 +63,25 @@ impl<'a> SessionLeaderExt for SessionLeaderProxy<'a> {
         }
         Ok(())
     }
+}
+
+#[proxy(
+    interface = "org.freedesktop.login1.Manager",
+    default_service = "org.freedesktop.login1",
+    default_path = "/org/freedesktop/login1",
+)]
+pub trait LogindManager {
+    fn inhibit(
+        &self,
+        what: &str,
+        who: &str,
+        why: &str,
+        mode: &str,
+    ) -> zbus::Result<zbus::zvariant::OwnedFd>;
+
+    #[zbus(signal)]
+    fn prepare_for_shutdown(&self, active: bool) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn prepare_for_sleep(&self, active: bool) -> zbus::Result<()>;
 }

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Niri (Rust Session)
+Comment=Niri using a custom rust-based session manager
+Exec=@sessionManager@ --config @configFile@
+Type=Application
+DesktopNames=niri
