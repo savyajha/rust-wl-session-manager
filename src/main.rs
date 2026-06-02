@@ -1,11 +1,15 @@
 mod scanner;
 mod systemd_utils;
 mod cli;
+mod dropin;
 
 use std::collections::HashSet;
+use std::env;
 use std::fs;
+use std::io::IsTerminal;
 use std::process;
-use systemd_utils::*;
+use dropin::{SESSION_TARGET, write_compositor_dropin};
+use systemd_utils::{SystemdManagerProxy, UnitProxy, LogindManagerProxy, UnitExt};
 use zbus::Connection;
 use clap::Parser;
 use futures_util::StreamExt;
@@ -14,8 +18,12 @@ use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 enum ShutdownReason {
-    /// The compositor unit went inactive on its own (user quit niri).
-    CompositorExited,
+    /// The session-anchor target went inactive. This is the single definition
+    /// of "session over": a clean compositor quit (OnSuccess=) or a terminal
+    /// crash-loop (OnFailure=) both run compositor-logout.service, which stops
+    /// the target. A bare compositor restart or an absorbed crash does NOT
+    /// reach here — the target stays active across it.
+    SessionEnded,
     /// logind PrepareForShutdown(true) fired. The system is tearing everything
     /// down; release the inhibitor cleanly.
     SystemInitiated,
@@ -33,11 +41,18 @@ fn init_logging() {
             .with(layer)
             .try_init()
             .map(|_| "journald"),
-        Err(_) => tracing_subscriber::registry()
-            .with(filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-            .try_init()
-            .map(|_| "stderr"),
+        Err(e) => {
+            eprintln!("journald unavailable ({e}); falling back to stderr");
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(std::io::stderr().is_terminal())
+                        .with_writer(std::io::stderr),
+                )
+                .try_init()
+                .map(|_| "stderr")
+        }
     };
 
     match result {
@@ -70,6 +85,28 @@ async fn vars_added_since(
     current.difference(baseline).cloned().collect()
 }
 
+/// Unset every environment variable that appeared since `baseline` was
+/// snapshotted. Each variable name is interpolated into the log message (not
+/// attached as a structured field) so it is visible in journald's default
+/// output, mirroring the per-variable logging done at export.
+///
+/// This no longer stops the session target: under the current design the
+/// session target is either already stopped (it is what woke us) or is stopped
+/// by `compositor_shutdown` (which `Conflicts=` it), and that stop is what
+/// drives the ordered teardown of the compositor and its clients.
+async fn unset_session_environment(
+    manager: &SystemdManagerProxy<'_>,
+    baseline: &HashSet<String>,
+) {
+    let to_unset = vars_added_since(manager, baseline).await;
+    for var in &to_unset {
+        info!("unsetting environment variable {var}");
+    }
+    if let Err(e) = manager.unset_environment(&to_unset).await {
+        warn!(error = %e, "unset_environment failed");
+    }
+}
+
 async fn shutdown(
     reason: ShutdownReason,
     manager: &SystemdManagerProxy<'_>,
@@ -79,16 +116,16 @@ async fn shutdown(
     baseline: &HashSet<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match reason {
-        ShutdownReason::CompositorExited => {
-            info!("compositor exited; running teardown");
+        ShutdownReason::SessionEnded => {
+            // graphical-session.target went inactive — its stop is what woke us,
+            // and stopping it already tore down the compositor and the
+            // session-scoped clients in order (clients before the compositor,
+            // per their After=graphical-session.target). Nothing left to stop;
+            // just run the compositor shutdown unit (idempotent) and clean up
+            // the env we pushed.
+            info!("session ended; running teardown");
             manager.start_unit(&config.compositor_shutdown, "replace").await?;
-            let to_unset = vars_added_since(manager, baseline).await;
-            let (r1, r2) = tokio::join!(
-                manager.stop_unit("graphical-session.target", "replace"),
-                manager.unset_environment(&to_unset),
-            );
-            if let Err(e) = r1 { warn!(error = %e, "stop_unit graphical-session.target failed"); }
-            if let Err(e) = r2 { warn!(error = %e, "unset_environment failed"); }
+            unset_session_environment(manager, baseline).await;
         }
 
         ShutdownReason::SystemInitiated => {
@@ -103,42 +140,41 @@ async fn shutdown(
         }
 
         ShutdownReason::Terminated => {
-            info!("SIGTERM received; stopping compositor and running teardown");
+            info!("SIGTERM received; stopping session and running teardown");
 
-            // Subscribe before stop_unit: zbus PropertyStream is backed by a
-            // buffered broadcast channel, so any transition that occurs after
-            // subscription but before the first .next() is queued and will not
-            // be lost. The post-subscribe active_state() read handles the one
-            // race buffering cannot cover — a transition that completed before
-            // the subscription was established.
-            let unit_path = manager.get_unit(&config.compositor_service).await?;
-            let leader = SessionLeaderProxy::builder(conn)
+            // End the session by starting the shutdown unit, which Conflicts=
+            // graphical-session.target — so starting it stops the target, and
+            // that stop drives the ordered teardown (clients before the
+            // compositor). We then wait for the target to actually reach
+            // inactive so env cleanup does not race the teardown.
+            //
+            // Subscribe before issuing the stop: zbus PropertyStream is backed
+            // by a buffered broadcast channel, so any transition that occurs
+            // after subscription but before the first .next() is queued and
+            // will not be lost. The post-subscribe active_state() read handles
+            // the one race buffering cannot cover — a transition that completed
+            // before the subscription was established.
+            let unit_path = manager.get_unit(SESSION_TARGET).await?;
+            let target = UnitProxy::builder(conn)
                 .path(unit_path)?
                 .build()
                 .await?;
-            let mut exit_stream = leader.receive_active_state_changed().await;
-            let current_state = leader.active_state().await?;
+            let mut exit_stream = target.receive_active_state_changed().await;
+            let current_state = target.active_state().await?;
 
-            manager.stop_unit(&config.compositor_service, "replace").await?;
+            manager.start_unit(&config.compositor_shutdown, "replace").await?;
 
             if current_state != "inactive" && current_state != "failed" {
                 while let Some(change) = exit_stream.next().await {
-                    if let Ok(state) = change.get().await {
-                        if state == "inactive" || state == "failed" {
-                            break;
-                        }
+                    if let Ok(state) = change.get().await
+                        && (state == "inactive" || state == "failed")
+                    {
+                        break;
                     }
                 }
             }
 
-            manager.start_unit(&config.compositor_shutdown, "replace").await?;
-            let to_unset = vars_added_since(manager, baseline).await;
-            let (r1, r2) = tokio::join!(
-                manager.stop_unit("graphical-session.target", "replace"),
-                manager.unset_environment(&to_unset),
-            );
-            if let Err(e) = r1 { warn!(error = %e, "stop_unit graphical-session.target failed"); }
-            if let Err(e) = r2 { warn!(error = %e, "unset_environment failed"); }
+            unset_session_environment(manager, baseline).await;
         }
     }
 
@@ -155,8 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = cli::Cli::parse();
     let config_content = fs::read_to_string(&args.config)?;
-    let config: scanner::Config = toml::from_str(&config_content)
-        .expect("Invalid TOML config");
+    let config: scanner::Config = toml::from_str(&config_content)?;
 
     info!(config = ?args.config, "starting session");
 
@@ -166,6 +201,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let system_conn = Connection::system().await?;
     let manager = SystemdManagerProxy::new(&session_conn).await?;
     let logind = LogindManagerProxy::new(&system_conn).await?;
+
+    // systemd only emits unit signals — including the standard
+    // PropertiesChanged that backs every receive_active_state_changed()
+    // stream below — to clients that have called Subscribe(). Without this,
+    // the compositor-exit detection would silently never fire on systemd
+    // versions that gate PropertiesChanged behind a subscriber.
+    manager.subscribe().await?;
+
+    // Write the compositor's crash/quit policy as a runtime drop-in, leaving
+    // its packaged unit untouched. systemd does not pick up a new drop-in on
+    // its own, so reload before anything is started. Both steps are
+    // load-bearing — without them the compositor would restart-loop with no
+    // start limit and no crash-loop escape — so failures here are fatal, not
+    // best-effort.
+    let runtime_dir = env::var("XDG_RUNTIME_DIR")
+        .map_err(|_| "XDG_RUNTIME_DIR is not set; cannot write runtime drop-in")?;
+    write_compositor_dropin(&config, &runtime_dir)?;
+    manager.reload().await?;
 
     // Establish the shutdown signal stream BEFORE acquiring the inhibitor so
     // there is no window in which PrepareForShutdown could fire unobserved.
@@ -189,36 +242,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     manager.set_environment(&env_list).await?;
 
     // Clear any lingering failed state from a prior session; start_unit with
-    // mode "replace" does not reset a unit in the failed state on its own.
-    if let Err(e) = manager.reset_failed_unit(&config.compositor_service).await {
-        warn!(error = %e, unit = %config.compositor_service, "reset_failed_unit failed (ignoring)");
+    // mode "replace" does not reset a unit in the failed state on its own. A
+    // previous crash-loop may have left the compositor (and the session target
+    // it failed) in the failed state.
+    for unit in [config.compositor_service.as_str(), SESSION_TARGET] {
+        if let Err(e) = manager.reset_failed_unit(unit).await {
+            warn!(error = %e, unit = %unit, "reset_failed_unit failed (ignoring)");
+        }
     }
 
+    // Start the compositor. Its packaged unit is BindsTo=/Before=
+    // graphical-session.target, so starting it pulls the session target up.
+    // Selecting the compositor stays a pure config concern.
     info!(unit = %config.compositor_service, "starting compositor");
     manager.start_unit(&config.compositor_service, "replace").await?;
 
-    let unit_path = manager.get_unit(&config.compositor_service).await?;
-    let leader = SessionLeaderProxy::builder(&session_conn)
+    // Watch graphical-session.target, not the compositor. The compositor may
+    // stop and restart underneath the target any number of times; only the
+    // target going inactive means the session is over.
+    let unit_path = manager.get_unit(SESSION_TARGET).await?;
+    let session_target = UnitProxy::builder(&session_conn)
         .path(unit_path)?
         .build()
         .await?;
 
+    // Gate on the session target actually coming up before arming the exit
+    // watch. The target is inactive until the compositor finishes starting; a
+    // bare exit watch would read that startup-inactive as "session over" and
+    // tear down immediately. wait_for_unit_active returns as soon as it goes
+    // active (event-driven, no polling).
+    session_target.wait_for_unit_active().await?;
+
     let mut sigterm = signal(SignalKind::terminate())?;
 
-    // Pin the compositor-exit future so it is polled across loop iterations
+    // Pin the session-exit future so it is polled across loop iterations
     // without re-creating the internal property-change stream subscription.
-    let compositor_exit = leader.wait_for_unit_exit();
-    tokio::pin!(compositor_exit);
+    let session_exit = session_target.wait_for_unit_exit();
+    tokio::pin!(session_exit);
 
     info!("session started");
 
     // Loop handles PrepareForShutdown(false) (cancelled shutdown) without
-    // dropping the compositor-exit future's stream subscription.
+    // dropping the session-exit future's stream subscription.
     let reason = loop {
         tokio::select! {
-            result = &mut compositor_exit => {
+            result = &mut session_exit => {
                 result?;
-                break ShutdownReason::CompositorExited;
+                break ShutdownReason::SessionEnded;
             }
             Some(sig) = shutdown_stream.next() => {
                 if let Ok(args) = sig.args() {

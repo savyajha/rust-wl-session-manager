@@ -15,6 +15,9 @@ pub trait SystemdManager {
 
     fn subscribe(&self) -> zbus::Result<()>;
 
+    #[zbus(name = "Reload")]
+    fn reload(&self) -> zbus::Result<()>;
+
     fn start_unit(&self, name: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
 
     fn stop_unit(&self, name: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
@@ -33,16 +36,17 @@ pub trait SystemdManager {
     interface = "org.freedesktop.systemd1.Unit",
     default_service = "org.freedesktop.systemd1",
 )]
-pub trait SessionLeader {
+pub trait Unit {
     #[zbus(property)]
     fn active_state(&self) -> zbus::Result<String>;
 }
 
-pub trait SessionLeaderExt {
+pub trait UnitExt {
     async fn wait_for_unit_exit(&self) -> zbus::Result<()>;
+    async fn wait_for_unit_active(&self) -> zbus::Result<()>;
 }
 
-impl<'a> SessionLeaderExt for SessionLeaderProxy<'a> {
+impl<'a> UnitExt for UnitProxy<'a> {
     async fn wait_for_unit_exit(&self) -> zbus::Result<()> {
         // Subscribe first: PropertyStream buffers events from this point on.
         // The active_state() read below catches any transition that completed
@@ -55,10 +59,36 @@ impl<'a> SessionLeaderExt for SessionLeaderProxy<'a> {
         }
 
         while let Some(change) = stream.next().await {
-            if let Ok(state) = change.get().await {
-                if state == "inactive" || state == "failed" {
-                    break;
-                }
+            if let Ok(state) = change.get().await
+                && (state == "inactive" || state == "failed")
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Block until the unit reaches the `active` state. The mirror image of
+    /// `wait_for_unit_exit`, with the same subscribe-before-read ordering so no
+    /// transition is lost in the gap: subscribe first (the stream then buffers
+    /// every change), then read the current state to catch the case where the
+    /// unit was already active before we subscribed.
+    ///
+    /// Used to gate the session-exit watch on graphical-session.target until it
+    /// has actually come up — otherwise the `inactive` it holds during startup
+    /// would be misread as "session over".
+    async fn wait_for_unit_active(&self) -> zbus::Result<()> {
+        let mut stream = self.receive_active_state_changed().await;
+
+        if self.active_state().await? == "active" {
+            return Ok(());
+        }
+
+        while let Some(change) = stream.next().await {
+            if let Ok(state) = change.get().await
+                && state == "active"
+            {
+                break;
             }
         }
         Ok(())
@@ -81,7 +111,4 @@ pub trait LogindManager {
 
     #[zbus(signal)]
     fn prepare_for_shutdown(&self, active: bool) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    fn prepare_for_sleep(&self, active: bool) -> zbus::Result<()>;
 }
