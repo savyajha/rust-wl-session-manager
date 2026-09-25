@@ -19,7 +19,12 @@
 #                                      even though a Requisite= unit (the fake
 #                                      portal) keeps it "needed"
 #   6. clean compositor quit        -> session ENDS (same)
-#   7. shutdown/reboot              -> SystemInitiated: release inhibitor only
+#   7. environment restore          -> added vars unset, overwritten vars restored
+#   8. compositor fails to start    -> session ends, session-manager fails
+#   9. SIGTERM during startup       -> teardown still runs
+#  10. restart whose start is skipped by a failed condition, so only the Job
+#      property changes             -> session ENDS, no hang
+#  11. shutdown/reboot              -> SystemInitiated: release inhibitor only
 #
 # session-manager runs as a user service so its exit is the observable proxy
 # for "teardown ran / session is over".
@@ -30,10 +35,39 @@ let
   user = "alice";
   uid = 1000;
 
-  configFile = pkgs.writeText "session-manager-config.toml" ''
-    targets = [ "XDG_RUNTIME_DIR" ]
-    compositor_service = "niri.service"
+  mkConfig = compositor: pkgs.writeText "session-manager-${compositor}.toml" ''
+    targets = [ "XDG_RUNTIME_DIR", "SM_TEST_CHANGED", "SM_TEST_ADDED" ]
+    compositor_service = "${compositor}"
     compositor_shutdown = "niri-shutdown.target"
+  '';
+
+  # A session-manager instance driving `compositor`. SM_TEST_CHANGED overwrites
+  # a baseline value in the user manager; SM_TEST_ADDED is new to it.
+  mkSessionManager = compositor: {
+    description = "Session manager under test (${compositor})";
+    serviceConfig = {
+      Type = "simple";
+      ExecStart = "${sessionManager}/bin/session-manager --config ${mkConfig compositor}";
+      Environment = [ "SM_TEST_CHANGED=new" "SM_TEST_ADDED=1" ];
+    };
+  };
+
+  # Fake niri: like mkFakeUnit, but Type=notify like the packaged unit, and
+  # ready only after a second.
+  fakeCompositor = pkgs.writeShellScript "fake-niri" ''
+    trap 'echo "niri ''${EPOCHREALTIME/./}" >> /tmp/stop-order; exit 0' TERM
+    trap 'exit 0' USR1
+    ${pkgs.coreutils}/bin/sleep 1 & wait $!
+    ${pkgs.systemd}/bin/systemd-notify --ready
+    while true; do ${pkgs.coreutils}/bin/sleep 1 & wait $!; done
+  '';
+
+  # A compositor that takes a while to become ready, so a stop can land while
+  # session-manager is still waiting for its start job.
+  slowCompositor = pkgs.writeShellScript "fake-niri-slow" ''
+    ${pkgs.coreutils}/bin/sleep 20
+    ${pkgs.systemd}/bin/systemd-notify --ready
+    while true; do ${pkgs.coreutils}/bin/sleep 1; done
   '';
 
   # Records a stop timestamp so the test can assert stop ORDER. Each unit
@@ -83,10 +117,13 @@ pkgs.testers.runNixOSTest {
       unitConfig = {
         BindsTo = "graphical-session.target";
         Before = "graphical-session.target";
+        # A failed condition skips the start job without touching ActiveState.
+        ConditionPathExists = "!/tmp/block-niri";
       };
       serviceConfig = {
-        Type = "simple";
-        ExecStart = mkFakeUnit "niri";
+        Type = "notify";
+        NotifyAccess = "all";
+        ExecStart = fakeCompositor;
         KillSignal = "SIGTERM";
       };
     };
@@ -142,18 +179,44 @@ pkgs.testers.runNixOSTest {
       };
     };
 
-    systemd.user.services.session-manager = {
-      description = "Session manager under test";
+    # Fake compositor that exits before reporting ready, so its start job fails
+    # (Type=notify, like the packaged niri unit).
+    systemd.user.services.niri-broken = {
+      description = "Fake compositor that fails to start";
+      unitConfig = {
+        BindsTo = "graphical-session.target";
+        Before = "graphical-session.target";
+      };
       serviceConfig = {
-        Type = "simple";
-        ExecStart = "${sessionManager}/bin/session-manager --config ${configFile}";
+        Type = "notify";
+        ExecStart = "${pkgs.coreutils}/bin/false";
       };
     };
+
+    # Fake compositor that is slow to report ready.
+    systemd.user.services.niri-slow = {
+      description = "Fake compositor that is slow to start";
+      unitConfig = {
+        BindsTo = "graphical-session.target";
+        Before = "graphical-session.target";
+      };
+      serviceConfig = {
+        Type = "notify";
+        NotifyAccess = "all";
+        ExecStart = slowCompositor;
+      };
+    };
+
+    systemd.user.services.session-manager = mkSessionManager "niri.service";
+    systemd.user.services.session-manager-broken = mkSessionManager "niri-broken.service";
+    systemd.user.services.session-manager-slow = mkSessionManager "niri-slow.service";
 
     virtualisation.memorySize = 1024;
   };
 
   testScript = ''
+    from datetime import timedelta
+
     PREFIX = "sudo -u ${user} XDG_RUNTIME_DIR=/run/user/${toString uid} "
 
     def uctl(cmd):
@@ -177,8 +240,21 @@ pkgs.testers.runNixOSTest {
         wait_active("ironbar.service")
         wait_active("portal.service")
 
+    def user_env():
+        env = {}
+        for line in uctl("systemctl --user show-environment").splitlines():
+            name, _, value = line.partition("=")
+            env[name] = value
+        return env
+
+    def assert_env_restored():
+        env = user_env()
+        assert env.get("SM_TEST_CHANGED") == "old", f"SM_TEST_CHANGED not restored: {env}"
+        assert "SM_TEST_ADDED" not in env, f"SM_TEST_ADDED not unset: {env}"
+
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("user@${toString uid}.service")
+    uctl("systemctl --user set-environment SM_TEST_CHANGED=old")
 
     with subtest("session-manager starts compositor, session target, and clients"):
         start_session()
@@ -201,8 +277,13 @@ pkgs.testers.runNixOSTest {
         # `systemctl restart niri` is a stop + start in one job. The pending
         # start keeps graphical-session.target needed, so StopWhenUnneeded=
         # does not fire and the session carries on.
+        before = uctl("systemctl --user show -p InvocationID --value niri.service").strip()
         uctl("systemctl --user restart niri.service")
         wait_active("niri.service")
+        after = uctl("systemctl --user show -p InvocationID --value niri.service").strip()
+        assert after != before, f"niri was not restarted: InvocationID {before!r} unchanged"
+        machine.sleep(duration=timedelta(seconds=3))
+        is_active("niri.service")
         is_active("graphical-session.target")
         is_active("session-manager.service")
         is_active("ironbar.service")
@@ -210,7 +291,7 @@ pkgs.testers.runNixOSTest {
     with subtest("explicit stop of the session target -> ORDERED logout"):
         # The canonical logout path. Stopping graphical-session.target tears
         # down clients (ironbar) before the compositor (niri), per their
-        # ordering deps. session-manager observes the target inactive and exits.
+        # ordering deps. session-manager sees the compositor stop and exits.
         machine.succeed("rm -f /tmp/stop-order")
         uctl("systemctl --user stop graphical-session.target")
         wait_inactive("session-manager.service")
@@ -249,6 +330,56 @@ pkgs.testers.runNixOSTest {
         wait_inactive("graphical-session.target")
         wait_inactive("ironbar.service")
         wait_inactive("portal.service")
+
+    with subtest("session end restores the user manager environment"):
+        start_session()
+        env = user_env()
+        assert env.get("SM_TEST_CHANGED") == "new", f"SM_TEST_CHANGED not pushed: {env}"
+        assert env.get("SM_TEST_ADDED") == "1", f"SM_TEST_ADDED not pushed: {env}"
+        uctl("systemctl --user stop graphical-session.target")
+        wait_inactive("session-manager.service")
+        assert_env_restored()
+
+    with subtest("compositor fails to start -> session ends, env restored"):
+        uctl("systemctl --user reset-failed")
+        uctl("systemctl --user start session-manager-broken.service")
+        wait_inactive("session-manager-broken.service")
+        uctl("systemctl --user is-failed session-manager-broken.service")
+        machine.fail(PREFIX + "systemctl --user is-active graphical-session.target")
+        assert_env_restored()
+
+    with subtest("SIGTERM during startup -> teardown runs"):
+        uctl("systemctl --user reset-failed")
+        uctl("systemctl --user start session-manager-slow.service")
+        machine.wait_until_succeeds(
+            PREFIX + "systemctl --user show-environment | grep -q '^SM_TEST_ADDED='",
+            timeout=10,
+        )
+        machine.wait_until_succeeds(
+            PREFIX + "systemctl --user show -p ActiveState --value niri-slow.service"
+            + " | grep -qx activating",
+            timeout=10,
+        )
+        uctl("systemctl --user stop session-manager-slow.service")
+        machine.fail(PREFIX + "systemctl --user is-active session-manager-slow.service")
+        machine.fail(PREFIX + "systemctl --user is-failed session-manager-slow.service")
+        wait_inactive("graphical-session.target")
+        wait_inactive("niri-slow.service")
+        assert_env_restored()
+
+    with subtest("restart whose start is skipped -> session ends, no hang"):
+        # The stop half leaves niri inactive with the start job queued; the
+        # failed condition then drops the job while ActiveState stays inactive.
+        start_session()
+        machine.succeed("touch /tmp/block-niri")
+        uctl("systemctl --user restart niri.service")
+        wait_inactive("session-manager.service")
+        wait_inactive("niri.service")
+        wait_inactive("graphical-session.target")
+        condition = uctl("systemctl --user show -p ConditionResult --value niri.service").strip()
+        assert condition == "no", f"expected niri's start to be skipped, got ConditionResult={condition!r}"
+        machine.succeed("rm -f /tmp/block-niri")
+        assert_env_restored()
 
     with subtest("system shutdown -> SystemInitiated path, session comes back"):
         start_session()

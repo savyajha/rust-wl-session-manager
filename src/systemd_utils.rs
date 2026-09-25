@@ -1,6 +1,15 @@
 use zbus::proxy;
 use futures_util::StreamExt;
 
+/// Job mode that replaces any conflicting queued job.
+pub const MODE_REPLACE: &str = "replace";
+
+/// logind inhibitor lock type for system shutdown and reboot.
+pub const INHIBIT_SHUTDOWN: &str = "shutdown";
+
+/// logind inhibitor mode that delays the operation instead of blocking it.
+pub const INHIBIT_DELAY: &str = "delay";
+
 #[proxy(
     interface = "org.freedesktop.systemd1.Manager",
     default_service = "org.freedesktop.systemd1",
@@ -17,31 +26,23 @@ pub trait SystemdManager {
 
     fn start_unit(&self, name: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
 
-    fn stop_unit(&self, name: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
-
-    #[zbus(name = "GetUnit")]
-    fn get_unit(&self, name: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+    fn load_unit(&self, name: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
 
     #[zbus(name = "ResetFailedUnit")]
     fn reset_failed_unit(&self, name: &str) -> zbus::Result<()>;
 
-    /// Every queued job: (id, unit name, job type, job state, job path, unit path).
-    #[zbus(name = "ListJobs")]
-    #[allow(clippy::type_complexity)]
-    fn list_jobs(
+    /// A job finished; `result` is "done" on success, otherwise "failed", "canceled", etc.
+    #[zbus(signal)]
+    fn job_removed(
         &self,
-    ) -> zbus::Result<
-        Vec<(
-            u32,
-            String,
-            String,
-            String,
-            zbus::zvariant::OwnedObjectPath,
-            zbus::zvariant::OwnedObjectPath,
-        )>,
-    >;
+        id: u32,
+        job: zbus::zvariant::OwnedObjectPath,
+        unit: String,
+        result: String,
+    ) -> zbus::Result<()>;
 
-    #[zbus(property, name = "Environment")]
+    /// Uncached, so every read returns the manager's current environment.
+    #[zbus(property(emits_changed_signal = "false"), name = "Environment")]
     fn environment(&self) -> zbus::Result<Vec<String>>;
 }
 
@@ -52,59 +53,34 @@ pub trait SystemdManager {
 pub trait Unit {
     #[zbus(property)]
     fn active_state(&self) -> zbus::Result<String>;
+
+    /// The unit's queued job as (id, path); `(0, "/")` when none is queued.
+    #[zbus(property)]
+    fn job(&self) -> zbus::Result<(u32, zbus::zvariant::OwnedObjectPath)>;
 }
 
-pub trait UnitExt {
-    async fn wait_for_unit_exit(&self) -> zbus::Result<()>;
-    async fn wait_for_unit_active(&self) -> zbus::Result<()>;
+/// True if a unit's `ActiveState` means it has stopped, cleanly or not.
+fn stopped(state: &str) -> bool {
+    matches!(state, "inactive" | "failed")
 }
 
-impl<'a> UnitExt for UnitProxy<'a> {
-    async fn wait_for_unit_exit(&self) -> zbus::Result<()> {
-        // Subscribe first: PropertyStream buffers events from this point on.
-        // The active_state() read below catches any transition that completed
-        // before the subscription was established.
-        let mut stream = self.receive_active_state_changed().await;
-
-        let current = self.active_state().await?;
-        if current == "inactive" || current == "failed" {
-            return Ok(());
-        }
-
-        while let Some(change) = stream.next().await {
-            if let Ok(state) = change.get().await
-                && (state == "inactive" || state == "failed")
-            {
-                break;
+impl UnitProxy<'_> {
+    /// Wait until the unit is inactive or failed with no job queued to bring it back.
+    pub async fn wait_until_stopped(&self) -> zbus::Result<()> {
+        // Subscribe to both before reading, so a change in between is not lost.
+        let mut states = self.receive_active_state_changed().await;
+        let mut jobs = self.receive_job_changed().await;
+        loop {
+            let (job_id, _) = self.job().await?;
+            if job_id == 0 && stopped(&self.active_state().await?) {
+                return Ok(());
+            }
+            tokio::select! {
+                Some(_) = states.next() => {}
+                Some(_) = jobs.next() => {}
+                else => return Err(zbus::Error::Failure("unit property stream ended".to_owned())),
             }
         }
-        Ok(())
-    }
-
-    /// Block until the unit reaches the `active` state. The mirror image of
-    /// `wait_for_unit_exit`, with the same subscribe-before-read ordering so no
-    /// transition is lost in the gap: subscribe first (the stream then buffers
-    /// every change), then read the current state to catch the case where the
-    /// unit was already active before we subscribed.
-    ///
-    /// Used to gate the session-exit watch on graphical-session.target until it
-    /// has actually come up — otherwise the `inactive` it holds during startup
-    /// would be misread as "session over".
-    async fn wait_for_unit_active(&self) -> zbus::Result<()> {
-        let mut stream = self.receive_active_state_changed().await;
-
-        if self.active_state().await? == "active" {
-            return Ok(());
-        }
-
-        while let Some(change) = stream.next().await {
-            if let Ok(state) = change.get().await
-                && state == "active"
-            {
-                break;
-            }
-        }
-        Ok(())
     }
 }
 
