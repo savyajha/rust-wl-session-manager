@@ -93,7 +93,17 @@ The flake provides the package as `packages.<system>.default`. It includes a
 session file, `wayland-sessions/niri-rust-wl.desktop`, which runs
 rust-wl-session-manager with the config file given by the `configFile` override.
 
-A NixOS example:
+Add the flake as an input, following your own nixpkgs so that a second copy is
+not built:
+
+```nix
+inputs.rust-wl-session-manager = {
+  url = "github:savyajha/rust-wl-session-manager";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+Then, in your NixOS configuration:
 
 ```nix
 { inputs, pkgs, ... }:

@@ -13,3 +13,9 @@ futures-lite = "2"
 tracing = "0.1"
 tracing-journald = "0.3"
 tracing-subscriber = "0.3"
+
+# Whole-program optimisation, tuned for size: the daemon is idle, so speed does not matter.
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
