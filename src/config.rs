@@ -47,6 +47,9 @@ mod tests {
     fn unknown_keys_are_rejected() {
         let text = format!("env_vars = []\ncompositor = \"niri.service\"\n{UNITS}");
         let err = toml::from_str::<Config>(&text).unwrap_err();
-        assert!(err.to_string().contains("unknown field `compositor`"), "{err}");
+        assert!(
+            err.to_string().contains("unknown field `compositor`"),
+            "{err}"
+        );
     }
 }

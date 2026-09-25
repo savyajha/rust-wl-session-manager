@@ -10,6 +10,21 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        # Runs `command` on the source offline, with the package's vendored dependencies.
+        cargoCheck =
+          name: tools: command:
+          pkgs.stdenv.mkDerivation {
+            name = "session-manager-${name}";
+            inherit (self.packages.${system}.niri-session-manager) src cargoDeps;
+            nativeBuildInputs = [
+              pkgs.rustPlatform.cargoSetupHook
+              pkgs.cargo
+            ]
+            ++ tools;
+            buildPhase = command;
+            installPhase = "touch $out";
+            dontFixup = true;
+          };
       in
       {
         packages = rec {
@@ -25,6 +40,12 @@
             inherit pkgs;
             sessionManager = self.packages.${system}.niri-session-manager;
           };
+
+          fmt = cargoCheck "fmt" [ pkgs.rustfmt ] "cargo fmt --check";
+          clippy = cargoCheck "clippy" [
+            pkgs.rustc
+            pkgs.clippy
+          ] "cargo clippy --all-targets -- -D warnings";
         };
 
         devShells.default = pkgs.mkShell {

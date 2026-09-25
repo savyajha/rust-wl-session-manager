@@ -1,8 +1,6 @@
 {
   lib,
   rustPlatform,
-  pkg-config,
-  dbus,
   configFile ? "/etc/niri-session-manager/config.toml",
 }:
 
@@ -13,9 +11,6 @@ rustPlatform.buildRustPackage {
   src = ./.;
 
   cargoLock.lockFile = ./Cargo.lock;
-
-  nativeBuildInputs = [ pkg-config ];
-  buildInputs = [ dbus ];
 
   postInstall = ''
     install -Dm644 share/wayland-sessions/niri-rust.desktop.in \

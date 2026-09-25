@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env::{self, VarError};
 
-use futures_util::StreamExt;
+use futures_lite::StreamExt;
 use tracing::{info, warn};
 use zbus::proxy;
 use zbus::zvariant::OwnedObjectPath;
@@ -65,7 +65,10 @@ impl SystemdManagerProxy<'_> {
         let list = self.environment().await?;
         Ok(list
             .into_iter()
-            .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
+            .filter_map(|kv| {
+                kv.split_once('=')
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            })
             .collect())
     }
 
@@ -162,7 +165,10 @@ mod tests {
     use super::*;
 
     fn map(pairs: &[(&str, &str)]) -> Env {
-        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
     }
 
     #[test]

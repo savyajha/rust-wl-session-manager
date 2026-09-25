@@ -1,17 +1,18 @@
-mod cli;
 mod config;
 mod logind;
 mod systemd;
 
+use std::env;
+use std::ffi::OsString;
 use std::io::{self, IsTerminal};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, bail};
-use clap::Parser;
-use futures_util::StreamExt;
+use futures_lite::StreamExt;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing::{error, info, warn};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use zbus::Connection;
 use zbus::zvariant::{OwnedFd, OwnedObjectPath};
 
@@ -32,9 +33,16 @@ enum ShutdownReason {
     Terminated,
 }
 
+/// The path from exactly `--config <path>`, or `None` for any other arguments.
+fn parse_args(mut args: impl Iterator<Item = OsString>) -> Option<PathBuf> {
+    match (args.next(), args.next(), args.next()) {
+        (Some(flag), Some(path), None) if flag == "--config" => Some(path.into()),
+        _ => None,
+    }
+}
+
 /// Log to journald, or to stderr if journald is unavailable.
 fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let journald = tracing_journald::layer()
         .inspect_err(|e| eprintln!("journald unavailable ({e}); falling back to stderr"))
         .ok();
@@ -44,7 +52,7 @@ fn init_logging() {
             .with_writer(io::stderr)
     });
     tracing_subscriber::registry()
-        .with(filter)
+        .with(LevelFilter::INFO)
         .with(journald)
         .with(stderr)
         .init();
@@ -131,10 +139,15 @@ impl Session {
 async fn prepare_user_manager(
     compositor: &str,
 ) -> anyhow::Result<(SystemdManagerProxy<'static>, Env)> {
-    let conn = Connection::session().await.context("connecting to the session bus")?;
+    let conn = Connection::session()
+        .await
+        .context("connecting to the session bus")?;
     let manager = SystemdManagerProxy::new(&conn).await?;
     // systemd only emits unit and job signals to clients that have called Subscribe().
-    manager.subscribe().await.context("subscribing to systemd signals")?;
+    manager
+        .subscribe()
+        .await
+        .context("subscribing to systemd signals")?;
     let baseline = manager
         .env_snapshot()
         .await
@@ -151,7 +164,9 @@ async fn prepare_user_manager(
 
 /// System-bus half of startup: subscribe to `PrepareForShutdown` and take the shutdown inhibitor.
 async fn prepare_logind() -> anyhow::Result<(PrepareForShutdownStream, OwnedFd)> {
-    let conn = Connection::system().await.context("connecting to the system bus")?;
+    let conn = Connection::system()
+        .await
+        .context("connecting to the system bus")?;
     let logind = LogindManagerProxy::new(&conn).await?;
     // Set up the signal stream before taking the inhibitor, so no signal is missed.
     let shutdown_stream = logind.receive_prepare_for_shutdown().await?;
@@ -170,18 +185,27 @@ async fn prepare_logind() -> anyhow::Result<(PrepareForShutdownStream, OwnedFd)>
 }
 
 /// Listen for SIGTERM, load the config, prepare both buses, and push the session environment.
-async fn start() -> anyhow::Result<(Session, PrepareForShutdownStream, Signal)> {
+async fn start(config_path: &Path) -> anyhow::Result<(Session, PrepareForShutdownStream, Signal)> {
     // Registered before anything else, so a stop during startup still runs teardown.
     let sigterm = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
-    let cli = cli::Cli::parse();
-    let config = Config::load(&cli.config)?;
-    info!("starting session with config {}", cli.config.display());
+    let config = Config::load(config_path)?;
+    info!("starting session with config {}", config_path.display());
 
-    let ((manager, baseline), (shutdown_stream, inhibitor)) =
-        tokio::try_join!(prepare_user_manager(&config.compositor_service), prepare_logind())?;
-    manager.push_env(&config.env_vars).await.context("pushing the session environment")?;
+    let ((manager, baseline), (shutdown_stream, inhibitor)) = tokio::try_join!(
+        prepare_user_manager(&config.compositor_service),
+        prepare_logind()
+    )?;
+    manager
+        .push_env(&config.env_vars)
+        .await
+        .context("pushing the session environment")?;
 
-    let session = Session { config, manager, baseline, inhibitor };
+    let session = Session {
+        config,
+        manager,
+        baseline,
+        inhibitor,
+    };
     Ok((session, shutdown_stream, sigterm))
 }
 
@@ -200,7 +224,10 @@ async fn run(
             .unit_proxy(compositor)
             .await
             .with_context(|| format!("loading {compositor}"))?;
-        proxy.wait_until_stopped().await.with_context(|| format!("watching {compositor}"))
+        proxy
+            .wait_until_stopped()
+            .await
+            .with_context(|| format!("watching {compositor}"))
     };
     tokio::pin!(watch);
 
@@ -227,11 +254,16 @@ async fn run(
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    let Some(config_path) = parse_args(env::args_os().skip(1)) else {
+        eprintln!("usage: session-manager --config <path>");
+        return ExitCode::from(2);
+    };
     init_logging();
 
-    let Ok((session, shutdown_stream, sigterm)) = start().await.inspect_err(|e| error!("{e:#}"))
+    let Ok((session, shutdown_stream, sigterm)) =
+        start(&config_path).await.inspect_err(|e| error!("{e:#}"))
     else {
         return ExitCode::FAILURE;
     };
@@ -251,5 +283,20 @@ async fn main() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_config_with_a_path_parses() {
+        let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
+        assert_eq!(parse(&["--config", "a"]), Some(PathBuf::from("a")));
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&["--config"]), None);
+        assert_eq!(parse(&["--bogus", "x"]), None);
+        assert_eq!(parse(&["--config", "a", "b"]), None);
     }
 }
