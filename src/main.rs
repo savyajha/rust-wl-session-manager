@@ -6,7 +6,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::IsTerminal;
 use std::process;
-use systemd_utils::{SystemdManagerProxy, UnitProxy, LogindManagerProxy, UnitExt};
+use systemd_utils::{
+    LogindManagerProxy, PrepareForShutdownStream, SystemdManagerProxy, UnitExt, UnitProxy,
+};
 use zbus::Connection;
 use clap::Parser;
 use futures_util::StreamExt;
@@ -193,40 +195,21 @@ async fn shutdown(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_logging();
-
-    let args = cli::Cli::parse();
-    let config_content = fs::read_to_string(&args.config)?;
-    let config: scanner::Config = toml::from_str(&config_content)?;
-
-    info!(config = ?args.config, "starting session");
-
-    // Two separate buses: systemd user manager lives on the session bus,
-    // logind lives on the system bus.
-    let session_conn = Connection::session().await?;
-    let system_conn = Connection::system().await?;
-    let manager = SystemdManagerProxy::new(&session_conn).await?;
-    let logind = LogindManagerProxy::new(&system_conn).await?;
+/// Session-bus half of startup: everything the systemd user manager needs
+/// before the compositor can start. Returns the connection (kept for building
+/// unit proxies later), the manager proxy, and the environment baseline.
+async fn prepare_user_manager(
+    config: &scanner::Config,
+) -> zbus::Result<(Connection, SystemdManagerProxy<'static>, HashSet<String>)> {
+    let conn = Connection::session().await?;
+    let manager = SystemdManagerProxy::new(&conn).await?;
 
     // systemd only emits unit signals — including the standard
     // PropertiesChanged that backs every receive_active_state_changed()
-    // stream below — to clients that have called Subscribe(). Without this,
-    // the compositor-exit detection would silently never fire on systemd
-    // versions that gate PropertiesChanged behind a subscriber.
+    // stream — to clients that have called Subscribe(). Without this, the
+    // session-exit detection would silently never fire on systemd versions
+    // that gate PropertiesChanged behind a subscriber.
     manager.subscribe().await?;
-
-    // Establish the shutdown signal stream BEFORE acquiring the inhibitor so
-    // there is no window in which PrepareForShutdown could fire unobserved.
-    // Sleep is intentionally not inhibited: suspend/resume must be transparent
-    // — exiting on PrepareForSleep would cause greetd to respawn the greeter.
-    let mut shutdown_stream = logind.receive_prepare_for_shutdown().await?;
-
-    let inhibitor = logind
-        .inhibit("shutdown", "session-manager", "Graceful graphical session teardown", "delay")
-        .await?;
-    info!("inhibitor lock acquired");
 
     // Snapshot the user manager environment BEFORE we add anything. Cleanup
     // at teardown unsets only the vars that appeared after this point — what
@@ -235,7 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // XDG_RUNTIME_DIR, etc.) untouched.
     let baseline = env_var_names(&manager).await;
 
-    let env_list = scanner::export_env_vars(&config);
+    let env_list = scanner::export_env_vars(config);
     manager.set_environment(&env_list).await?;
 
     // Clear any lingering failed state from a prior session; start_unit with
@@ -252,6 +235,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => warn!("reset_failed_unit({unit}) failed (ignoring): {e}"),
         }
     }
+
+    Ok((conn, manager, baseline))
+}
+
+/// System-bus half of startup: subscribe to logind's PrepareForShutdown and
+/// take the shutdown delay inhibitor. Returns the signal stream (which keeps
+/// its own handle on the system bus connection) and the inhibitor fd, whose
+/// drop releases the lock.
+async fn prepare_logind() -> zbus::Result<(PrepareForShutdownStream, zbus::zvariant::OwnedFd)> {
+    let conn = Connection::system().await?;
+    let logind = LogindManagerProxy::new(&conn).await?;
+
+    // Establish the shutdown signal stream BEFORE acquiring the inhibitor so
+    // there is no window in which PrepareForShutdown could fire unobserved.
+    // Sleep is intentionally not inhibited: suspend/resume must be transparent
+    // — exiting on PrepareForSleep would cause greetd to respawn the greeter.
+    let shutdown_stream = logind.receive_prepare_for_shutdown().await?;
+
+    let inhibitor = logind
+        .inhibit("shutdown", "session-manager", "Graceful graphical session teardown", "delay")
+        .await?;
+    info!("inhibitor lock acquired");
+
+    Ok((shutdown_stream, inhibitor))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+
+    let args = cli::Cli::parse();
+    let config_content = fs::read_to_string(&args.config)?;
+    let config: scanner::Config = toml::from_str(&config_content)?;
+
+    info!(config = ?args.config, "starting session");
+
+    // The two buses are independent: the systemd user manager lives on the
+    // session bus, logind on the system bus, and neither side's setup needs
+    // anything from the other. Run them concurrently; both must be done
+    // before the compositor starts.
+    let ((session_conn, manager, baseline), (mut shutdown_stream, inhibitor)) =
+        tokio::try_join!(prepare_user_manager(&config), prepare_logind())?;
 
     // Start the compositor. Its packaged unit is BindsTo=/Before=
     // graphical-session.target, so starting it pulls the session target up.
