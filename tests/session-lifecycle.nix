@@ -295,7 +295,8 @@ pkgs.testers.runNixOSTest {
         machine.succeed("rm -f /tmp/stop-order")
         uctl("systemctl --user stop graphical-session.target")
         wait_inactive("session-manager.service")
-        wait_inactive("niri.service")
+        # Teardown waits for the compositor, so niri is already down, without waiting.
+        machine.fail(PREFIX + "systemctl --user is-active niri.service")
         wait_inactive("ironbar.service")
         # ORDER ASSERTION: ironbar's stop timestamp must precede niri's, so the
         # bar never outlives the compositor's Wayland socket.
