@@ -25,6 +25,22 @@ pub trait SystemdManager {
     #[zbus(name = "ResetFailedUnit")]
     fn reset_failed_unit(&self, name: &str) -> zbus::Result<()>;
 
+    /// Every queued job: (id, unit name, job type, job state, job path, unit path).
+    #[zbus(name = "ListJobs")]
+    #[allow(clippy::type_complexity)]
+    fn list_jobs(
+        &self,
+    ) -> zbus::Result<
+        Vec<(
+            u32,
+            String,
+            String,
+            String,
+            zbus::zvariant::OwnedObjectPath,
+            zbus::zvariant::OwnedObjectPath,
+        )>,
+    >;
+
     #[zbus(property, name = "Environment")]
     fn environment(&self) -> zbus::Result<Vec<String>>;
 }

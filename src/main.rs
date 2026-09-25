@@ -16,25 +16,26 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// The freedesktop session target session-manager watches. The compositor's
-/// packaged unit binds itself to it (niri: `BindsTo=`/`Before=`), and every
-/// session client is `PartOf=` it, so its lifetime is the lifetime of one
-/// compositor instance. Its ActiveState going inactive is the single
-/// definition of "session over".
+/// The freedesktop session target. The compositor's packaged unit binds itself
+/// to it (niri: `BindsTo=`/`Before=`) and every session client is `PartOf=` it,
+/// so stopping it tears the whole session down in order. session-manager does
+/// not rely on it stopping by itself when the compositor dies: units such as
+/// xdg-desktop-portal are `Requisite=` it and outlive the compositor, which
+/// keeps it "needed" and defeats its StopWhenUnneeded=. Ending the session
+/// therefore always stops it explicitly, via `compositor_shutdown`.
 const SESSION_TARGET: &str = "graphical-session.target";
 
 /// D-Bus error systemd returns when asked about a unit that is not loaded.
 const NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
 
 enum ShutdownReason {
-    /// The session target went inactive. This is the single definition of
-    /// "session over". The compositor has no Restart= policy, so any exit —
-    /// a clean quit, a crash, or a logout that stops the target — ends the
-    /// session: once the compositor is gone nothing needs the target, it stops
-    /// (StopWhenUnneeded=), and its PartOf= clients stop with it. Every
-    /// Wayland client dies with the compositor anyway, so there is nothing
-    /// worth keeping alive across a compositor restart.
-    SessionEnded,
+    /// The compositor stopped for good: inactive or failed, with no start job
+    /// queued. This is the single definition of "session over". The compositor
+    /// has no Restart= policy, so any exit — a clean quit, a crash, or a logout
+    /// that stops the session target (which stops the compositor via BindsTo=)
+    /// — ends the session. Every Wayland client dies with the compositor
+    /// anyway, so there is nothing worth keeping alive across it.
+    CompositorExited,
     /// logind PrepareForShutdown(true) fired. The system is tearing everything
     /// down; release the inhibitor cleanly.
     SystemInitiated,
@@ -101,10 +102,8 @@ async fn vars_added_since(
 /// attached as a structured field) so it is visible in journald's default
 /// output, mirroring the per-variable logging done at export.
 ///
-/// This no longer stops the session target: under the current design the
-/// session target is either already stopped (it is what woke us) or is stopped
-/// by `compositor_shutdown` (which `Conflicts=` it), and that stop is what
-/// drives the ordered teardown of the compositor and its clients.
+/// Called only after the session target has stopped, so nothing still
+/// starting up in the session can race the unset.
 async fn unset_session_environment(
     manager: &SystemdManagerProxy<'_>,
     baseline: &HashSet<String>,
@@ -118,24 +117,66 @@ async fn unset_session_environment(
     }
 }
 
+/// True if a start (or restart) job is queued for `unit`. Asked via ListJobs
+/// rather than the unit's cached `Job` property, so the answer is current.
+async fn start_pending(manager: &SystemdManagerProxy<'_>, unit: &str) -> zbus::Result<bool> {
+    let jobs = manager.list_jobs().await?;
+    Ok(jobs
+        .iter()
+        .any(|(_, name, kind, ..)| name == unit && (kind == "start" || kind == "restart")))
+}
+
+/// Resolve once the compositor has stopped for good: inactive or failed with
+/// no start job queued. A manual `systemctl --user restart` passes through
+/// inactive with its start job still pending — that is not the end of the
+/// session, so wait for it to come back up and keep watching.
+async fn wait_for_compositor_gone(
+    manager: &SystemdManagerProxy<'_>,
+    compositor: &UnitProxy<'_>,
+    name: &str,
+) -> zbus::Result<()> {
+    loop {
+        compositor.wait_for_unit_exit().await?;
+        if !start_pending(manager, name).await? {
+            return Ok(());
+        }
+        compositor.wait_for_unit_active().await?;
+    }
+}
+
+/// End the session: start `compositor_shutdown`, which `Conflicts=` the
+/// session target (and graphical-session-pre.target), so the target stops and
+/// its `PartOf=` clients stop with it — clients before the compositor, per
+/// their `After=`. Wait for the target to actually reach inactive so the env
+/// cleanup does not race the teardown, then unset what we pushed.
+///
+/// wait_for_unit_exit subscribes and then reads the current state, so it is
+/// fine to call after the stop has been issued: a transition that completed in
+/// between is caught by the read.
+async fn end_session(
+    manager: &SystemdManagerProxy<'_>,
+    session_target: &UnitProxy<'_>,
+    config: &scanner::Config,
+    baseline: &HashSet<String>,
+) -> zbus::Result<()> {
+    manager.start_unit(&config.compositor_shutdown, "replace").await?;
+    session_target.wait_for_unit_exit().await?;
+    unset_session_environment(manager, baseline).await;
+    Ok(())
+}
+
 async fn shutdown(
     reason: ShutdownReason,
     manager: &SystemdManagerProxy<'_>,
-    conn: &Connection,
+    session_target: &UnitProxy<'_>,
     inhibitor: zbus::zvariant::OwnedFd,
     config: &scanner::Config,
     baseline: &HashSet<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match reason {
-        ShutdownReason::SessionEnded => {
-            // graphical-session.target went inactive — its stop is what woke us,
-            // and the session-scoped clients have already been stopped with it.
-            // Run the compositor shutdown unit anyway: it is idempotent, and it
-            // also stops graphical-session-pre.target, which nothing else takes
-            // down after a compositor crash. Then clean up the env we pushed.
-            info!("session ended; running teardown");
-            manager.start_unit(&config.compositor_shutdown, "replace").await?;
-            unset_session_environment(manager, baseline).await;
+        ShutdownReason::CompositorExited => {
+            info!("compositor exited; ending session");
+            end_session(manager, session_target, config, baseline).await?;
         }
 
         ShutdownReason::SystemInitiated => {
@@ -150,41 +191,8 @@ async fn shutdown(
         }
 
         ShutdownReason::Terminated => {
-            info!("SIGTERM received; stopping session and running teardown");
-
-            // End the session by starting the shutdown unit, which Conflicts=
-            // graphical-session.target — so starting it stops the target, and
-            // that stop drives the ordered teardown (clients before the
-            // compositor). We then wait for the target to actually reach
-            // inactive so env cleanup does not race the teardown.
-            //
-            // Subscribe before issuing the stop: zbus PropertyStream is backed
-            // by a buffered broadcast channel, so any transition that occurs
-            // after subscription but before the first .next() is queued and
-            // will not be lost. The post-subscribe active_state() read handles
-            // the one race buffering cannot cover — a transition that completed
-            // before the subscription was established.
-            let unit_path = manager.get_unit(SESSION_TARGET).await?;
-            let target = UnitProxy::builder(conn)
-                .path(unit_path)?
-                .build()
-                .await?;
-            let mut exit_stream = target.receive_active_state_changed().await;
-            let current_state = target.active_state().await?;
-
-            manager.start_unit(&config.compositor_shutdown, "replace").await?;
-
-            if current_state != "inactive" && current_state != "failed" {
-                while let Some(change) = exit_stream.next().await {
-                    if let Ok(state) = change.get().await
-                        && (state == "inactive" || state == "failed")
-                    {
-                        break;
-                    }
-                }
-            }
-
-            unset_session_environment(manager, baseline).await;
+            info!("SIGTERM received; ending session");
+            end_session(manager, session_target, config, baseline).await?;
         }
     }
 
@@ -285,40 +293,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(unit = %config.compositor_service, "starting compositor");
     manager.start_unit(&config.compositor_service, "replace").await?;
 
-    // Watch graphical-session.target, not the compositor: every way a session
-    // ends (compositor quit or crash, logout, niri-shutdown.target) passes
-    // through the target going inactive. A manual `systemctl --user restart`
-    // of the compositor keeps the target active (the restart job keeps it
-    // needed), so that alone does not end the session.
-    let unit_path = manager.get_unit(SESSION_TARGET).await?;
+    // Watch the compositor itself: every way a session ends (quit, crash, a
+    // logout that stops the session target) ends with the compositor stopped.
+    // Both units are loaded now that the start job has been queued. The
+    // session target proxy is kept for end_session.
+    let compositor_path = manager.get_unit(&config.compositor_service).await?;
+    let compositor = UnitProxy::builder(&session_conn)
+        .path(compositor_path)?
+        .build()
+        .await?;
+    let target_path = manager.get_unit(SESSION_TARGET).await?;
     let session_target = UnitProxy::builder(&session_conn)
-        .path(unit_path)?
+        .path(target_path)?
         .build()
         .await?;
 
-    // Gate on the session target actually coming up before arming the exit
-    // watch. The target is inactive until the compositor finishes starting; a
-    // bare exit watch would read that startup-inactive as "session over" and
-    // tear down immediately. wait_for_unit_active returns as soon as it goes
-    // active (event-driven, no polling).
-    session_target.wait_for_unit_active().await?;
+    // Wait for the compositor to finish starting (it is Type=notify, so
+    // "active" means ready) before logging the session as started.
+    // wait_for_unit_active returns as soon as it goes active (event-driven, no
+    // polling).
+    compositor.wait_for_unit_active().await?;
 
     let mut sigterm = signal(SignalKind::terminate())?;
 
-    // Pin the session-exit future so it is polled across loop iterations
-    // without re-creating the internal property-change stream subscription.
-    let session_exit = session_target.wait_for_unit_exit();
-    tokio::pin!(session_exit);
+    // Pin the exit future so it is polled across loop iterations without
+    // re-creating the internal property-change stream subscription.
+    let compositor_gone =
+        wait_for_compositor_gone(&manager, &compositor, &config.compositor_service);
+    tokio::pin!(compositor_gone);
 
     info!("session started");
 
     // Loop handles PrepareForShutdown(false) (cancelled shutdown) without
-    // dropping the session-exit future's stream subscription.
+    // dropping the exit future's stream subscription.
     let reason = loop {
         tokio::select! {
-            result = &mut session_exit => {
+            result = &mut compositor_gone => {
                 result?;
-                break ShutdownReason::SessionEnded;
+                break ShutdownReason::CompositorExited;
             }
             Some(sig) = shutdown_stream.next() => {
                 if let Ok(args) = sig.args() {
@@ -332,5 +344,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    shutdown(reason, &manager, &session_conn, inhibitor, &config, &baseline).await
+    shutdown(reason, &manager, &session_target, inhibitor, &config, &baseline).await
 }

@@ -4,9 +4,10 @@
 # for the compositor, wired to graphical-session.target exactly as niri does
 # upstream (BindsTo=/Before=graphical-session.target). A dummy `ironbar.service`
 # stands in for a Wayland-client bar (After=/PartOf=graphical-session.target).
-# Because the architecture watches graphical-session.target rather than the
-# compositor, these dummies exercise the same systemd semantics a real session
-# would. session-manager runs as the real binary against them.
+# A dummy `portal.service` is Requisite= the target like xdg-desktop-portal,
+# which keeps the target "needed" after the compositor dies. These dummies
+# exercise the same systemd semantics a real session would. session-manager
+# runs as the real binary against them.
 #
 # Behaviours asserted:
 #   1. compositor unit is used as packaged: no runtime drop-in, no Restart=
@@ -14,8 +15,10 @@
 #   3. explicit `systemctl restart` of the compositor -> session SURVIVES
 #   4. explicit stop of gst         -> session ENDS (the logout path), ORDERED:
 #                                      ironbar stops BEFORE niri (socket stays valid)
-#   5. compositor crash             -> session ENDS (gst stops, clients follow)
-#   6. clean compositor quit        -> session ENDS
+#   5. compositor crash             -> session ENDS: gst is stopped explicitly
+#                                      even though a Requisite= unit (the fake
+#                                      portal) keeps it "needed"
+#   6. clean compositor quit        -> session ENDS (same)
 #   7. shutdown/reboot              -> SystemInitiated: release inhibitor only
 #
 # session-manager runs as a user service so its exit is the observable proxy
@@ -102,8 +105,26 @@ pkgs.testers.runNixOSTest {
       };
     };
 
-    # graphical-session.target — the anchor session-manager watches. Defined
-    # explicitly so it exists as a stoppable unit in the test.
+    # Fake portal, shaped like xdg-desktop-portal.service upstream: not a
+    # Wayland client (so it outlives the compositor) and Requisite= the
+    # session target, which keeps the target "needed" after the compositor is
+    # gone and defeats its StopWhenUnneeded=. Without an explicit stop of the
+    # target, a compositor exit would leave the session up and unusable.
+    systemd.user.services.portal = {
+      description = "Fake portal (test stand-in for xdg-desktop-portal)";
+      wantedBy = [ "graphical-session.target" ];
+      after = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      requisite = [ "graphical-session.target" ];
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = mkFakeUnit "portal";
+        KillSignal = "SIGTERM";
+      };
+    };
+
+    # graphical-session.target — the anchor the session's units hang off.
+    # Defined explicitly so it exists as a stoppable unit in the test.
     systemd.user.targets.graphical-session = {
       description = "Current graphical user session (test)";
     };
@@ -154,6 +175,7 @@ pkgs.testers.runNixOSTest {
         wait_active("niri.service")
         wait_active("graphical-session.target")
         wait_active("ironbar.service")
+        wait_active("portal.service")
 
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("user@${toString uid}.service")
@@ -209,14 +231,16 @@ pkgs.testers.runNixOSTest {
         )
 
     with subtest("compositor crash -> session ends"):
-        # With niri gone nothing needs gst; StopWhenUnneeded= stops it, its
-        # PartOf= clients stop with it, and session-manager tears down. No
-        # ordering to assert: niri is already dead before anything stops.
+        # The fake portal keeps gst "needed", so gst does NOT stop by itself.
+        # session-manager must notice niri is gone and stop gst explicitly via
+        # niri-shutdown.target; its PartOf= clients (ironbar, portal) stop with
+        # it. No ordering to assert: niri is already dead before anything stops.
         start_session()
         uctl("systemctl --user kill --signal=SIGKILL niri.service")
         wait_inactive("session-manager.service")
         wait_inactive("graphical-session.target")
         wait_inactive("ironbar.service")
+        wait_inactive("portal.service")
 
     with subtest("clean compositor quit -> session ends"):
         start_session()
@@ -224,6 +248,7 @@ pkgs.testers.runNixOSTest {
         wait_inactive("session-manager.service")
         wait_inactive("graphical-session.target")
         wait_inactive("ironbar.service")
+        wait_inactive("portal.service")
 
     with subtest("system shutdown -> SystemInitiated path, session comes back"):
         start_session()
