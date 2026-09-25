@@ -9,13 +9,14 @@
 # would. session-manager runs as the real binary against them.
 #
 # Behaviours asserted:
-#   1. single compositor crash      -> session SURVIVES (Restart=always)
-#   2. clean compositor quit        -> session SURVIVES (respawn, no OnSuccess)
-#   3. compositor crash-loop        -> session ENDS (OnFailure -> shutdown unit)
-#   4. explicit stop of gst         -> session ENDS (the logout path)
-#   5. shutdown/reboot              -> SystemInitiated: release inhibitor only
-#   6. inhibits shutdown, not sleep
-#   7. ORDERED teardown: ironbar stops BEFORE niri (socket stays valid)
+#   1. compositor unit is used as packaged: no runtime drop-in, no Restart=
+#   2. inhibits shutdown, not sleep
+#   3. explicit `systemctl restart` of the compositor -> session SURVIVES
+#   4. explicit stop of gst         -> session ENDS (the logout path), ORDERED:
+#                                      ironbar stops BEFORE niri (socket stays valid)
+#   5. compositor crash             -> session ENDS (gst stops, clients follow)
+#   6. clean compositor quit        -> session ENDS
+#   7. shutdown/reboot              -> SystemInitiated: release inhibitor only
 #
 # session-manager runs as a user service so its exit is the observable proxy
 # for "teardown ran / session is over".
@@ -30,8 +31,6 @@ let
     targets = [ "XDG_RUNTIME_DIR" ]
     compositor_service = "niri.service"
     compositor_shutdown = "niri-shutdown.target"
-    start_limit_interval_sec = 60
-    start_limit_burst = 3
   '';
 
   # Records a stop timestamp so the test can assert stop ORDER. Each unit
@@ -74,9 +73,8 @@ pkgs.testers.runNixOSTest {
 
     # Fake compositor, wired to graphical-session.target like niri upstream:
     # BindsTo (gst falls when niri is gone for good) + Before (niri starts
-    # before gst, so it stops AFTER gst — i.e. last). NO Restart=/OnFailure=
-    # here: session-manager injects those at runtime via the drop-in, so this
-    # also proves the drop-in takes effect.
+    # before gst, so it stops AFTER gst — i.e. last). No Restart=, like the
+    # packaged niri unit: a compositor exit of any kind ends the session.
     systemd.user.services.niri = {
       description = "Fake compositor (test stand-in for niri)";
       unitConfig = {
@@ -162,13 +160,11 @@ pkgs.testers.runNixOSTest {
 
     with subtest("session-manager starts compositor, session target, and clients"):
         start_session()
-        # The runtime drop-in must exist and carry policy, NOT anchor wiring.
-        conf = "/run/user/${toString uid}/systemd/user/niri.service.d/50-session-manager.conf"
-        machine.succeed(f"test -f {conf}")
-        machine.succeed(f"grep -q 'Restart=always' {conf}")
-        machine.succeed(f"grep -q 'RestartMode=direct' {conf}")
-        machine.succeed(f"grep -q 'OnFailure=niri-shutdown.target' {conf}")
-        machine.fail(f"grep -q 'compositor.target' {conf}")
+        # The compositor unit is used exactly as packaged: session-manager
+        # writes no runtime drop-in and adds no restart policy.
+        machine.fail("test -e /run/user/${toString uid}/systemd/user/niri.service.d")
+        restart = uctl("systemctl --user show -p Restart --value niri.service").strip()
+        assert restart == "no", f"expected Restart=no on niri, got: {restart!r}"
 
     with subtest("inhibits shutdown (delay) but never sleep"):
         smline = machine.succeed(
@@ -179,27 +175,10 @@ pkgs.testers.runNixOSTest {
         assert smline.rstrip().endswith("delay"), f"expected mode=delay, got: {smline}"
         assert "sleep" not in smline, f"sleep must not be inhibited, got: {smline}"
 
-    with subtest("single compositor crash -> session survives"):
-        uctl("systemctl --user reset-failed niri.service")
-        uctl("systemctl --user kill --signal=SIGKILL niri.service")
-        wait_active("niri.service")
-        is_active("graphical-session.target")
-        is_active("session-manager.service")
-
-    with subtest("clean compositor quit -> session survives (respawn, no logout)"):
-        uctl("systemctl --user reset-failed niri.service")
-        uctl("systemctl --user kill --signal=SIGUSR1 niri.service")
-        wait_active("niri.service")
-        is_active("graphical-session.target")
-        is_active("session-manager.service")
-
     with subtest("explicit restart of the compositor -> session survives"):
-        # `systemctl restart niri` is a clean stop + start. Because niri only
-        # BindsTo=/Before= graphical-session.target (directional: gst stopping
-        # stops niri, not the reverse) and there is no OnSuccess= handler,
-        # restarting niri must NOT take the session down. Only a direct stop of
-        # graphical-session.target ends the session.
-        uctl("systemctl --user reset-failed niri.service")
+        # `systemctl restart niri` is a stop + start in one job. The pending
+        # start keeps graphical-session.target needed, so StopWhenUnneeded=
+        # does not fire and the session carries on.
         uctl("systemctl --user restart niri.service")
         wait_active("niri.service")
         is_active("graphical-session.target")
@@ -229,22 +208,22 @@ pkgs.testers.runNixOSTest {
             f"ironbar must stop before niri, got: {order!r}"
         )
 
-    with subtest("crash-loop -> session ends via OnFailure (ordered)"):
+    with subtest("compositor crash -> session ends"):
+        # With niri gone nothing needs gst; StopWhenUnneeded= stops it, its
+        # PartOf= clients stop with it, and session-manager tears down. No
+        # ordering to assert: niri is already dead before anything stops.
         start_session()
-        machine.succeed("rm -f /tmp/stop-order")
-        # Crash faster than the start limit (burst=3 / 60s) so niri reaches the
-        # failed state; OnFailure=niri-shutdown.target then stops gst.
-        for _ in range(5):
-            machine.execute(PREFIX + "systemctl --user kill --signal=SIGKILL niri.service")
-            machine.sleep(1)
+        uctl("systemctl --user kill --signal=SIGKILL niri.service")
         wait_inactive("session-manager.service")
         wait_inactive("graphical-session.target")
-        # Ordering still holds on the crash-loop logout path: ironbar stopped
-        # via the gst teardown, before niri's final stop.
-        order = machine.succeed("cat /tmp/stop-order")
-        ts = {name: int(t) for name, t in (l.split() for l in order.strip().splitlines())}
-        if "ironbar" in ts and "niri" in ts:
-            assert ts["ironbar"] < ts["niri"], f"ironbar must stop before niri, got: {order}"
+        wait_inactive("ironbar.service")
+
+    with subtest("clean compositor quit -> session ends"):
+        start_session()
+        uctl("systemctl --user kill --signal=SIGUSR1 niri.service")
+        wait_inactive("session-manager.service")
+        wait_inactive("graphical-session.target")
+        wait_inactive("ironbar.service")
 
     with subtest("system shutdown -> SystemInitiated path, session comes back"):
         start_session()

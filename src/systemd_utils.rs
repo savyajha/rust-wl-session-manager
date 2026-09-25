@@ -15,9 +15,6 @@ pub trait SystemdManager {
 
     fn subscribe(&self) -> zbus::Result<()>;
 
-    #[zbus(name = "Reload")]
-    fn reload(&self) -> zbus::Result<()>;
-
     fn start_unit(&self, name: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
 
     fn stop_unit(&self, name: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;

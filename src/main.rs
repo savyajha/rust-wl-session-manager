@@ -1,14 +1,11 @@
 mod scanner;
 mod systemd_utils;
 mod cli;
-mod dropin;
 
 use std::collections::HashSet;
-use std::env;
 use std::fs;
 use std::io::IsTerminal;
 use std::process;
-use dropin::{SESSION_TARGET, write_compositor_dropin};
 use systemd_utils::{SystemdManagerProxy, UnitProxy, LogindManagerProxy, UnitExt};
 use zbus::Connection;
 use clap::Parser;
@@ -17,12 +14,24 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+/// The freedesktop session target session-manager watches. The compositor's
+/// packaged unit binds itself to it (niri: `BindsTo=`/`Before=`), and every
+/// session client is `PartOf=` it, so its lifetime is the lifetime of one
+/// compositor instance. Its ActiveState going inactive is the single
+/// definition of "session over".
+const SESSION_TARGET: &str = "graphical-session.target";
+
+/// D-Bus error systemd returns when asked about a unit that is not loaded.
+const NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
+
 enum ShutdownReason {
-    /// The session-anchor target went inactive. This is the single definition
-    /// of "session over": a clean compositor quit (OnSuccess=) or a terminal
-    /// crash-loop (OnFailure=) both run compositor-logout.service, which stops
-    /// the target. A bare compositor restart or an absorbed crash does NOT
-    /// reach here — the target stays active across it.
+    /// The session target went inactive. This is the single definition of
+    /// "session over". The compositor has no Restart= policy, so any exit —
+    /// a clean quit, a crash, or a logout that stops the target — ends the
+    /// session: once the compositor is gone nothing needs the target, it stops
+    /// (StopWhenUnneeded=), and its PartOf= clients stop with it. Every
+    /// Wayland client dies with the compositor anyway, so there is nothing
+    /// worth keeping alive across a compositor restart.
     SessionEnded,
     /// logind PrepareForShutdown(true) fired. The system is tearing everything
     /// down; release the inhibitor cleanly.
@@ -118,11 +127,10 @@ async fn shutdown(
     match reason {
         ShutdownReason::SessionEnded => {
             // graphical-session.target went inactive — its stop is what woke us,
-            // and stopping it already tore down the compositor and the
-            // session-scoped clients in order (clients before the compositor,
-            // per their After=graphical-session.target). Nothing left to stop;
-            // just run the compositor shutdown unit (idempotent) and clean up
-            // the env we pushed.
+            // and the session-scoped clients have already been stopped with it.
+            // Run the compositor shutdown unit anyway: it is idempotent, and it
+            // also stops graphical-session-pre.target, which nothing else takes
+            // down after a compositor crash. Then clean up the env we pushed.
             info!("session ended; running teardown");
             manager.start_unit(&config.compositor_shutdown, "replace").await?;
             unset_session_environment(manager, baseline).await;
@@ -209,17 +217,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // versions that gate PropertiesChanged behind a subscriber.
     manager.subscribe().await?;
 
-    // Write the compositor's crash/quit policy as a runtime drop-in, leaving
-    // its packaged unit untouched. systemd does not pick up a new drop-in on
-    // its own, so reload before anything is started. Both steps are
-    // load-bearing — without them the compositor would restart-loop with no
-    // start limit and no crash-loop escape — so failures here are fatal, not
-    // best-effort.
-    let runtime_dir = env::var("XDG_RUNTIME_DIR")
-        .map_err(|_| "XDG_RUNTIME_DIR is not set; cannot write runtime drop-in")?;
-    write_compositor_dropin(&config, &runtime_dir)?;
-    manager.reload().await?;
-
     // Establish the shutdown signal stream BEFORE acquiring the inhibitor so
     // there is no window in which PrepareForShutdown could fire unobserved.
     // Sleep is intentionally not inhibited: suspend/resume must be transparent
@@ -243,23 +240,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Clear any lingering failed state from a prior session; start_unit with
     // mode "replace" does not reset a unit in the failed state on its own. A
-    // previous crash-loop may have left the compositor (and the session target
-    // it failed) in the failed state.
+    // compositor crash in the previous session leaves it failed.
+    //
+    // On a fresh user manager neither unit is loaded yet, and systemd answers
+    // NoSuchUnit — expected, so it is ignored silently. The error is put in
+    // the message text (not a structured field) so journalctl shows it.
     for unit in [config.compositor_service.as_str(), SESSION_TARGET] {
-        if let Err(e) = manager.reset_failed_unit(unit).await {
-            warn!(error = %e, unit = %unit, "reset_failed_unit failed (ignoring)");
+        match manager.reset_failed_unit(unit).await {
+            Ok(()) => {}
+            Err(zbus::Error::MethodError(name, _, _)) if name.as_str() == NO_SUCH_UNIT => {}
+            Err(e) => warn!("reset_failed_unit({unit}) failed (ignoring): {e}"),
         }
     }
 
     // Start the compositor. Its packaged unit is BindsTo=/Before=
     // graphical-session.target, so starting it pulls the session target up.
-    // Selecting the compositor stays a pure config concern.
+    // Selecting the compositor stays a pure config concern; its packaged unit
+    // is used as-is, with no Restart= policy added.
     info!(unit = %config.compositor_service, "starting compositor");
     manager.start_unit(&config.compositor_service, "replace").await?;
 
-    // Watch graphical-session.target, not the compositor. The compositor may
-    // stop and restart underneath the target any number of times; only the
-    // target going inactive means the session is over.
+    // Watch graphical-session.target, not the compositor: every way a session
+    // ends (compositor quit or crash, logout, niri-shutdown.target) passes
+    // through the target going inactive. A manual `systemctl --user restart`
+    // of the compositor keeps the target active (the restart job keeps it
+    // needed), so that alone does not end the session.
     let unit_path = manager.get_unit(SESSION_TARGET).await?;
     let session_target = UnitProxy::builder(&session_conn)
         .path(unit_path)?
