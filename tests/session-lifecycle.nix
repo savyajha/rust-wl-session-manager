@@ -36,7 +36,7 @@ let
   uid = 1000;
 
   mkConfig = compositor: pkgs.writeText "session-manager-${compositor}.toml" ''
-    targets = [ "XDG_RUNTIME_DIR", "SM_TEST_CHANGED", "SM_TEST_ADDED" ]
+    env_vars = [ "XDG_RUNTIME_DIR", "SM_TEST_CHANGED", "SM_TEST_ADDED" ]
     compositor_service = "${compositor}"
     compositor_shutdown = "niri-shutdown.target"
   '';
@@ -47,7 +47,7 @@ let
     description = "Session manager under test (${compositor})";
     serviceConfig = {
       Type = "simple";
-      ExecStart = "${sessionManager}/bin/session-manager --config ${mkConfig compositor}";
+      ExecStart = "${sessionManager}/bin/rust-wl-session-manager --config ${mkConfig compositor}";
       Environment = [ "SM_TEST_CHANGED=new" "SM_TEST_ADDED=1" ];
     };
   };
@@ -267,7 +267,7 @@ pkgs.testers.runNixOSTest {
     with subtest("inhibits shutdown (delay) but never sleep"):
         smline = machine.succeed(
             "COLUMNS=200 systemd-inhibit --list --no-legend --no-pager "
-            "| grep session-manager"
+            "| grep rust-wl-session-manager"
         )
         assert "shutdown" in smline, f"expected a shutdown inhibitor, got: {smline}"
         assert smline.rstrip().endswith("delay"), f"expected mode=delay, got: {smline}"
@@ -385,7 +385,7 @@ pkgs.testers.runNixOSTest {
     with subtest("system shutdown -> SystemInitiated path, session comes back"):
         start_session()
         machine.succeed(
-            "systemd-inhibit --list --no-legend --no-pager | grep -q session-manager"
+            "systemd-inhibit --list --no-legend --no-pager | grep -q rust-wl-session-manager"
         )
 
         machine.shutdown()

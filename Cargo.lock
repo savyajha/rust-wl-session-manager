@@ -349,6 +349,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "rust-wl-session-manager"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-lite",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-journald",
+ "tracing-subscriber",
+ "zbus",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -415,21 +430,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
-]
-
-[[package]]
-name = "session-manager"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "futures-lite",
- "serde",
- "tokio",
- "toml",
- "tracing",
- "tracing-journald",
- "tracing-subscriber",
- "zbus",
 ]
 
 [[package]]

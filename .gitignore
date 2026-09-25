@@ -2,3 +2,4 @@
 niri.env
 .codebase-index-cache.pkl
 /result
+/.claude/

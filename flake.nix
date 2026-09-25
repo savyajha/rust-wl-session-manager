@@ -1,5 +1,5 @@
 {
-  description = "Minimal systemd-based session manager for niri";
+  description = "Minimal systemd-based session manager for Wayland compositors (tested with niri)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -14,8 +14,8 @@
         cargoCheck =
           name: tools: command:
           pkgs.stdenv.mkDerivation {
-            name = "session-manager-${name}";
-            inherit (self.packages.${system}.niri-session-manager) src cargoDeps;
+            name = "rust-wl-session-manager-${name}";
+            inherit (self.packages.${system}.rust-wl-session-manager) src cargoDeps;
             nativeBuildInputs = [
               pkgs.rustPlatform.cargoSetupHook
               pkgs.cargo
@@ -28,8 +28,8 @@
       in
       {
         packages = rec {
-          niri-session-manager = pkgs.callPackage ./package.nix { };
-          default = niri-session-manager;
+          rust-wl-session-manager = pkgs.callPackage ./package.nix { };
+          default = rust-wl-session-manager;
         };
 
         checks = {
@@ -38,7 +38,7 @@
           # only. Run with: nix build .#checks.<system>.session-lifecycle
           session-lifecycle = import ./tests/session-lifecycle.nix {
             inherit pkgs;
-            sessionManager = self.packages.${system}.niri-session-manager;
+            sessionManager = self.packages.${system}.rust-wl-session-manager;
           };
 
           fmt = cargoCheck "fmt" [ pkgs.rustfmt ] "cargo fmt --check";
@@ -49,7 +49,7 @@
         };
 
         devShells.default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${system}.niri-session-manager ];
+          inputsFrom = [ self.packages.${system}.rust-wl-session-manager ];
           packages = with pkgs; [
             rust-analyzer
             clippy

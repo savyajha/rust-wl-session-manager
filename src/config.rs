@@ -4,12 +4,11 @@ use std::path::Path;
 use anyhow::Context;
 use serde::Deserialize;
 
-/// The session-manager config file.
+/// The rust-wl-session-manager config file.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Names of the variables to push into the systemd user manager.
-    #[serde(alias = "targets")]
     pub env_vars: Vec<String>,
     /// The compositor's user unit, e.g. `niri.service`.
     pub compositor_service: String,
@@ -34,13 +33,11 @@ mod tests {
                          compositor_shutdown = \"niri-shutdown.target\"\n";
 
     #[test]
-    fn env_vars_and_targets_alias_both_parse() {
-        for key in ["env_vars", "targets"] {
-            let config: Config = toml::from_str(&format!("{key} = [\"PATH\"]\n{UNITS}")).unwrap();
-            assert_eq!(config.env_vars, ["PATH"], "key {key}");
-            assert_eq!(config.compositor_service, "niri.service");
-            assert_eq!(config.compositor_shutdown, "niri-shutdown.target");
-        }
+    fn config_parses() {
+        let config: Config = toml::from_str(&format!("env_vars = [\"PATH\"]\n{UNITS}")).unwrap();
+        assert_eq!(config.env_vars, ["PATH"]);
+        assert_eq!(config.compositor_service, "niri.service");
+        assert_eq!(config.compositor_shutdown, "niri-shutdown.target");
     }
 
     #[test]

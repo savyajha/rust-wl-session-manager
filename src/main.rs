@@ -20,7 +20,7 @@ use config::Config;
 use logind::{INHIBIT_DELAY, INHIBIT_SHUTDOWN, LogindManagerProxy, PrepareForShutdownStream};
 use systemd::{Env, JobRemovedStream, MODE_REPLACE, NO_SUCH_UNIT, SystemdManagerProxy};
 
-/// The freedesktop session target, which session-manager stops explicitly (see DESIGN.md).
+/// The freedesktop session target, which rust-wl-session-manager stops explicitly (see DESIGN.md).
 const SESSION_TARGET: &str = "graphical-session.target";
 
 /// Why the session run ended.
@@ -29,7 +29,7 @@ enum ShutdownReason {
     CompositorExited,
     /// logind sent `PrepareForShutdown(true)`.
     SystemInitiated,
-    /// SIGTERM, e.g. from `systemctl --user stop session-manager`.
+    /// SIGTERM, e.g. from `systemctl --user stop` of its unit.
     Terminated,
 }
 
@@ -174,7 +174,7 @@ async fn prepare_logind() -> anyhow::Result<(PrepareForShutdownStream, OwnedFd)>
     let inhibitor = logind
         .inhibit(
             INHIBIT_SHUTDOWN,
-            "session-manager",
+            "rust-wl-session-manager",
             "Graceful graphical session teardown",
             INHIBIT_DELAY,
         )
@@ -257,7 +257,7 @@ async fn run(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let Some(config_path) = parse_args(env::args_os().skip(1)) else {
-        eprintln!("usage: session-manager --config <path>");
+        eprintln!("usage: rust-wl-session-manager --config <path>");
         return ExitCode::from(2);
     };
     init_logging();
