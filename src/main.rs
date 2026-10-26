@@ -7,10 +7,12 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use futures_lite::StreamExt;
 use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::time::{Instant, timeout_at};
 use tracing::{error, info, warn};
 use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use zbus::Connection;
@@ -18,10 +20,16 @@ use zbus::zvariant::{OwnedFd, OwnedObjectPath};
 
 use config::Config;
 use logind::{INHIBIT_DELAY, INHIBIT_SHUTDOWN, LogindManagerProxy, PrepareForShutdownStream};
-use systemd::{Env, JobRemovedStream, MODE_REPLACE, NO_SUCH_UNIT, SystemdManagerProxy};
+use systemd::{
+    Env, JobRemovedStream, MODE_REPLACE, MODE_REPLACE_IRREVERSIBLY, NO_SUCH_UNIT,
+    SystemdManagerProxy,
+};
 
 /// The freedesktop session target, which rust-wl-session-manager stops explicitly (see DESIGN.md).
 const SESSION_TARGET: &str = "graphical-session.target";
+
+/// How long teardown waits for the session target and the compositor to stop (see DESIGN.md).
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Why the session run ended.
 enum ShutdownReason {
@@ -97,6 +105,7 @@ struct Session {
 impl Session {
     /// End the graphical session, restore the environment, and release the inhibitor.
     /// Logs each failure and returns whether every step succeeded.
+    #[must_use]
     async fn teardown(self) -> bool {
         info!("running teardown");
         let stopped = self.stop_session().await;
@@ -112,22 +121,26 @@ impl Session {
         stopped.is_ok() && restored.is_ok()
     }
 
-    /// Start `compositor_shutdown`, then wait for the session target and the compositor to stop.
+    /// Start `compositor_shutdown`, then wait up to `STOP_TIMEOUT` for the session target and
+    /// the compositor to stop.
     async fn stop_session(&self) -> anyhow::Result<()> {
         let shutdown = &self.config.compositor_shutdown;
+        // Irreversibly, so that a D-Bus activation during teardown cannot cancel the target's
+        // stop job (see DESIGN.md).
         self.manager
-            .start_unit(shutdown, MODE_REPLACE)
+            .start_unit(shutdown, MODE_REPLACE_IRREVERSIBLY)
             .await
             .with_context(|| format!("starting {shutdown}"))?;
+        let deadline = Instant::now() + STOP_TIMEOUT;
         for unit in [SESSION_TARGET, self.config.compositor_service.as_str()] {
             let proxy = self
                 .manager
                 .unit_proxy(unit)
                 .await
                 .with_context(|| format!("loading {unit}"))?;
-            proxy
-                .wait_until_stopped()
+            timeout_at(deadline, proxy.wait_until_stopped())
                 .await
+                .with_context(|| format!("{unit} did not stop within {STOP_TIMEOUT:?}"))?
                 .with_context(|| format!("waiting for {unit} to stop"))?;
         }
         Ok(())

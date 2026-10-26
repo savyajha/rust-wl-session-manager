@@ -9,6 +9,9 @@ use zbus::zvariant::OwnedObjectPath;
 /// Job mode that replaces any conflicting queued job.
 pub const MODE_REPLACE: &str = "replace";
 
+/// Like `MODE_REPLACE`, but later transactions cannot replace or cancel the queued jobs.
+pub const MODE_REPLACE_IRREVERSIBLY: &str = "replace-irreversibly";
+
 /// D-Bus error systemd returns when asked about a unit that is not loaded.
 pub const NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
 

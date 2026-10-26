@@ -24,7 +24,12 @@
 #   9. SIGTERM during startup       -> teardown still runs
 #  10. restart whose start is skipped by a failed condition, so only the Job
 #      property changes             -> session ENDS, no hang
-#  11. shutdown/reboot              -> SystemInitiated: release inhibitor only
+#  11. a client stopping during teardown starts a Requisite= unit the way a
+#      D-Bus activation does       -> the activation cannot cancel the target's
+#                                      stop job, session ENDS cleanly
+#  12. a client that never stops   -> teardown gives up after its timeout,
+#                                      restores the env, exits non-zero
+#  13. shutdown/reboot              -> SystemInitiated: release inhibitor only
 #
 # session-manager runs as a user service so its exit is the observable proxy
 # for "teardown ran / session is over".
@@ -81,6 +86,19 @@ let
     # SIGUSR1 = clean self-exit (compositor "quit" path); only niri traps it.
     trap 'exit 0' USR1
     while true; do sleep 1 & wait $!; done
+  '';
+
+  # A client that, while stopping, asks for a portal. dbus-broker activates a
+  # bus name by calling StartUnit(unit, "replace"), which this reproduces.
+  portalClient = pkgs.writeShellScript "fake-portal-client" ''
+    trap '${pkgs.systemd}/bin/systemctl --user start --no-block activated-portal.service; exit 0' TERM
+    while true; do sleep 1 & wait $!; done
+  '';
+
+  # A client that ignores SIGTERM, so it holds up the target's stop job.
+  stubbornClient = pkgs.writeShellScript "fake-stubborn" ''
+    trap "" TERM
+    while true; do sleep 1; done
   '';
 in
 pkgs.testers.runNixOSTest {
@@ -157,6 +175,34 @@ pkgs.testers.runNixOSTest {
         Type = "simple";
         ExecStart = mkFakeUnit "portal";
         KillSignal = "SIGTERM";
+      };
+    };
+
+    # Fake D-Bus-activated portal, shaped like xdg-desktop-portal.service:
+    # Requisite= the session target. Starting it queues a verify-active job
+    # for the target, which in "replace" mode cancels a pending stop job.
+    systemd.user.services.activated-portal = {
+      description = "Fake D-Bus-activated portal";
+      after = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      requisite = [ "graphical-session.target" ];
+      serviceConfig.ExecStart = mkFakeUnit "activated-portal";
+    };
+
+    # Started only by the subtests that need them.
+    systemd.user.services.portal-client = {
+      description = "Fake client that activates a portal while stopping";
+      after = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      serviceConfig.ExecStart = portalClient;
+    };
+    systemd.user.services.stubborn = {
+      description = "Fake client that ignores SIGTERM";
+      after = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      serviceConfig = {
+        ExecStart = stubbornClient;
+        TimeoutStopSec = 120;
       };
     };
 
@@ -381,6 +427,37 @@ pkgs.testers.runNixOSTest {
         assert condition == "no", f"expected niri's start to be skipped, got ConditionResult={condition!r}"
         machine.succeed("rm -f /tmp/block-niri")
         assert_env_restored()
+
+    with subtest("activation during teardown cannot cancel the target's stop"):
+        # The real hang: a client stopping during teardown activated
+        # xdg-desktop-portal, whose Requisite= job replaced the target's stop
+        # job, so the target stayed up and teardown waited forever.
+        start_session()
+        uctl("systemctl --user start portal-client.service")
+        uctl("systemctl --user kill --signal=SIGUSR1 niri.service")
+        wait_inactive("session-manager.service", timeout=30)
+        machine.fail(PREFIX + "systemctl --user is-failed session-manager.service")
+        wait_inactive("graphical-session.target")
+        machine.fail(PREFIX + "systemctl --user is-active activated-portal.service")
+        assert_env_restored()
+
+    with subtest("a client that never stops -> teardown times out and exits"):
+        start_session()
+        uctl("systemctl --user start stubborn.service")
+        uctl("systemctl --user kill --signal=SIGUSR1 niri.service")
+        # Teardown gives up after 10 s; stubborn's own stop timeout is 120 s.
+        wait_inactive("session-manager.service", timeout=30)
+        uctl("systemctl --user is-failed session-manager.service")
+        uctl("systemctl --user is-active graphical-session.target")
+        machine.fail(
+            "systemd-inhibit --list --no-legend --no-pager | grep -q rust-wl-session-manager"
+        )
+        assert_env_restored()
+        machine.succeed(
+            "journalctl -b --no-pager | grep -q 'graphical-session.target did not stop within'"
+        )
+        uctl("systemctl --user kill --signal=SIGKILL stubborn.service")
+        wait_inactive("graphical-session.target")
 
     with subtest("system shutdown -> SystemInitiated path, session comes back"):
         start_session()

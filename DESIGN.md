@@ -22,11 +22,24 @@ compositor, which keeps the target "needed" and defeats its
 explicitly by starting the configured `compositor_shutdown` unit (for niri,
 `niri-shutdown.target`), which `Conflicts=` the target.
 
+The shutdown unit is started with job mode `replace-irreversibly`, as niri's
+own `niri-session` script does. In `replace` mode, a D-Bus activation during
+teardown cancels the target's stop job: a client that is still stopping asks
+for `xdg-desktop-portal`, dbus-broker starts it with `StartUnit(…, "replace")`,
+and its `Requisite=` queues a verify-active job for the target, which replaces
+the pending stop job. The shutdown unit is then reached and stopped again as
+unneeded, while the target stays up. Irreversible jobs cannot be replaced, so
+the activation fails instead.
+
 Teardown then waits for the target and the compositor to stop before it
 restores the environment, so the restore cannot race units that are still
 stopping. This relies on the compositor unit being bound to the target (niri's
 packaged unit has `BindsTo=`), so that stopping the target stops the
-compositor and the wait is bounded.
+compositor. The wait is bounded by 10 seconds, because a client that hangs
+while stopping holds up the target for its own stop timeout (90 seconds by
+default), and greetd shows its greeter again only after rust-wl-session-manager
+exits. On a timeout, teardown logs the unit that did not stop, restores the
+environment anyway, releases the inhibitor, and exits with 1.
 
 ## No restart policy for the compositor
 
