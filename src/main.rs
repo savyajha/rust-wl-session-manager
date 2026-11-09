@@ -16,7 +16,7 @@ use tokio::time::{Instant, timeout_at};
 use tracing::{error, info, warn};
 use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use zbus::Connection;
-use zbus::zvariant::{OwnedFd, OwnedObjectPath};
+use zbus::{OwnedFd, OwnedObjectPath};
 
 use config::Config;
 use logind::{INHIBIT_DELAY, INHIBIT_SHUTDOWN, LogindManagerProxy, PrepareForShutdownStream};

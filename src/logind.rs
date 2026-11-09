@@ -1,5 +1,5 @@
+use zbus::OwnedFd;
 use zbus::proxy;
-use zbus::zvariant::OwnedFd;
 
 /// Inhibitor lock type for system shutdown and reboot.
 pub const INHIBIT_SHUTDOWN: &str = "shutdown";

@@ -3,8 +3,8 @@ use std::env::{self, VarError};
 
 use futures_lite::StreamExt;
 use tracing::{info, warn};
+use zbus::OwnedObjectPath;
 use zbus::proxy;
-use zbus::zvariant::OwnedObjectPath;
 
 /// Job mode that replaces any conflicting queued job.
 pub const MODE_REPLACE: &str = "replace";
